@@ -70,7 +70,8 @@ class AbstractPreemptionWatchdog(ABC):
     async def stop(self) -> None:
         """Gracefully stop the polling loop and release network resources."""
         self._running = False
-        if self._task and not self._task.done():
+        curr_task = asyncio.current_task()
+        if self._task and not self._task.done() and self._task is not curr_task:
             self._task.cancel()
             try:
                 await self._task
@@ -92,7 +93,7 @@ class AbstractPreemptionWatchdog(ABC):
 
                 if event is not None and not self._preemption_detected:
                     self._preemption_detected = True
-                    await self.notify_callbacks(event)
+                    asyncio.create_task(self.notify_callbacks(event))
                     # Once preemption is detected, we can stop polling or remain active
                     break
 

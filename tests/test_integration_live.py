@@ -94,6 +94,7 @@ async def full_cluster():
     await proxy.stop()
     await active_engine.stop()
     await standby_engine.stop()
+    await asyncio.sleep(0.05)
 
 
 @pytest.mark.asyncio

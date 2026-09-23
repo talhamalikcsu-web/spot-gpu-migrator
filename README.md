@@ -37,3 +37,35 @@ Spot GPU instances offer **65% to 80% cost savings** over on-demand GPU instance
 - **Software Developer**: Core daemon, proxy, and networking implementation.
 - **QA Engineer**: Automated chaos test suite and zero-loss verification.
 - **UI/UX Developer**: Real-time CLI / TUI dashboard and live metrics.
+
+## CLI & Terminal Dashboard Usage
+
+### 1. Live Migration Simulation Demo
+Spin up a local multi-process simulation cluster (Mock AWS IMDSv2, Active & Standby Spot Nodes, Ingress Proxy), stream LLM completion tokens, inject preemption chaos, and watch live zero-downtime migration on the Rich TUI dashboard:
+```bash
+python cli.py demo
+```
+Options:
+- `--provider {aws,gcp,runpod}`: Target cloud metadata hypervisor (default: `aws`)
+- `--deadline SECONDS`: Grace period duration (default: `30.0`s)
+- `--notice-at-seq INT`: Token sequence index at which preemption is injected (default: `6`)
+- `--speed-ms FLOAT`: Inter-token delay in ms (default: `35.0`ms)
+
+### 2. Standalone Dashboard Demo
+Inspect the Terminal UI layout, real-time dollar savings counter ticker, and animated state transitions standalone:
+```bash
+python ui/dashboard.py
+```
+
+### 3. Automated Test Suite Runner
+Execute the acceptance test matrix with executive Rich reporting:
+```bash
+python cli.py test
+```
+
+### 4. Cluster Status Inspection
+Query running SGM Ingress Proxy and Node Daemons:
+```bash
+python cli.py status
+```
+
