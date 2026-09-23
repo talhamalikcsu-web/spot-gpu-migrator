@@ -8,12 +8,16 @@ and signals the Ingress Proxy.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 from datetime import datetime, timezone
 import json
 import logging
+import os
+import signal
 import time
 from typing import Any, Callable, Dict, List, Optional
+import uuid
 
 import aiohttp
 from aiohttp import web
@@ -27,6 +31,8 @@ from daemon.models import (
     PreemptionEvent,
     SGMError,
 )
+from daemon.integrations.base import AbstractInferenceEngineHook
+from daemon.integrations.vllm import VLLMInferenceEngineHook
 from daemon.transport.p2p_client import P2PClient
 from daemon.transport.p2p_server import P2PServer
 from daemon.watchdog.base import AbstractPreemptionWatchdog
@@ -50,6 +56,7 @@ class NodeDaemon:
         proxy_url: str = "http://127.0.0.1:8000",
         watchdog: Optional[AbstractPreemptionWatchdog] = None,
         engine_url: str = "http://127.0.0.1:8001",
+        engine_hook: Optional[AbstractInferenceEngineHook] = None,
     ) -> None:
         self.node_id = node_id
         self.role = role.lower()
@@ -60,6 +67,7 @@ class NodeDaemon:
         self.proxy_url = proxy_url.rstrip("/")
         self.engine_url = engine_url.rstrip("/")
         self.watchdog = watchdog
+        self.engine_hook = engine_hook or VLLMInferenceEngineHook(base_url=self.engine_url)
 
         # FSM State
         self.state: NodeLifecycleState = NodeLifecycleState.HEALTHY
@@ -247,7 +255,15 @@ class NodeDaemon:
             logger.error("Could not notify proxy of handover failure: %s", exc)
 
     async def _pause_local_engine(self) -> None:
-        """Sends pause command to local LLM inference engine."""
+        """Sends pause / abort command to local LLM inference engine."""
+        logger.info("Freezing local inference engine for node %s...", self.node_id)
+        if self.engine_hook:
+            for req_id in list(self.active_sessions.keys()):
+                try:
+                    await self.engine_hook.abort_request(req_id)
+                except Exception as exc:
+                    logger.debug("Failed aborting req %s via engine hook: %s", req_id, exc)
+
         session = await self._get_http_session()
         url = f"{self.engine_url}/pause"
         try:
@@ -281,6 +297,11 @@ class NodeDaemon:
     async def _teardown_resources(self) -> None:
         """Gracefully frees resources prior to spot node termination."""
         logger.info("Tearing down node resources...")
+        if self.engine_hook and hasattr(self.engine_hook, "close"):
+            try:
+                await self.engine_hook.close()
+            except Exception as exc:
+                logger.debug("Error closing engine hook: %s", exc)
         if self.watchdog:
             await self.watchdog.stop()
         if self.p2p_server:
@@ -367,3 +388,100 @@ class NodeDaemon:
             await self._runner.cleanup()
             self._runner = None
         logger.info("Node Daemon %s stopped.", self.node_id)
+
+
+def main() -> None:
+    """CLI and container entrypoint for SGM Node Daemon."""
+    parser = argparse.ArgumentParser(
+        prog="sgm-node-daemon",
+        description="Spot GPU Migrator (SGM) Node Daemon & Preemption Watchdog",
+    )
+    parser.add_argument("--node-id", default=os.environ.get("SGM_NODE_ID", f"spot-node-{uuid.uuid4().hex[:8]}"))
+    parser.add_argument("--role", default=os.environ.get("SGM_ROLE", "active"), choices=["active", "standby"])
+    parser.add_argument("--control-port", type=int, default=int(os.environ.get("SGM_CONTROL_PORT", "9001")))
+    parser.add_argument("--p2p-port", type=int, default=int(os.environ.get("SGM_P2P_PORT", "9002")))
+    parser.add_argument("--standby-host", default=os.environ.get("SGM_STANDBY_HOST", "127.0.0.1"))
+    parser.add_argument("--standby-p2p-port", type=int, default=int(os.environ.get("SGM_STANDBY_P2P_PORT", "9002")))
+    parser.add_argument("--proxy-url", default=os.environ.get("SGM_PROXY_URL", "http://127.0.0.1:8000"))
+    parser.add_argument("--engine-url", default=os.environ.get("SGM_ENGINE_URL", "http://127.0.0.1:8001"))
+    parser.add_argument("--cloud-provider", default=os.environ.get("SGM_CLOUD_PROVIDER", "aws"), choices=["aws", "gcp", "runpod", "mock", "none"])
+    parser.add_argument("--metadata-url", default=os.environ.get("SGM_METADATA_URL", None))
+    parser.add_argument("--poll-interval-ms", type=int, default=int(os.environ.get("SGM_POLL_INTERVAL_MS", "250")))
+    parser.add_argument("--timeout-ms", type=int, default=int(os.environ.get("SGM_TIMEOUT_MS", "100")))
+    parser.add_argument("--log-level", default=os.environ.get("SGM_LOG_LEVEL", "INFO"))
+
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper(), logging.INFO),
+        format="%(asctime)s [%(levelname)s] [%(name)s] %(message)s",
+    )
+
+    # Instantiate watchdog if active role
+    watchdog: Optional[AbstractPreemptionWatchdog] = None
+    if args.role == "active" and args.cloud_provider != "none":
+        if args.cloud_provider == "aws":
+            from daemon.watchdog.aws import AWSPreemptionWatchdog
+            watchdog = AWSPreemptionWatchdog(
+                base_url=args.metadata_url or "http://169.254.169.254",
+                poll_interval_ms=args.poll_interval_ms,
+                timeout_ms=args.timeout_ms,
+            )
+        elif args.cloud_provider == "gcp":
+            from daemon.watchdog.gcp import GCPPreemptionWatchdog
+            watchdog = GCPPreemptionWatchdog(
+                base_url=args.metadata_url or "http://metadata.google.internal",
+                poll_interval_ms=args.poll_interval_ms,
+                timeout_ms=args.timeout_ms,
+            )
+        elif args.cloud_provider == "runpod":
+            from daemon.watchdog.runpod import RunPodPreemptionWatchdog
+            watchdog = RunPodPreemptionWatchdog(
+                status_url=args.metadata_url or "http://127.0.0.1:8080/pod/status",
+                poll_interval_ms=args.poll_interval_ms,
+                timeout_ms=args.timeout_ms,
+            )
+
+    daemon = NodeDaemon(
+        node_id=args.node_id,
+        role=args.role,
+        control_port=args.control_port,
+        p2p_port=args.p2p_port,
+        standby_host=args.standby_host,
+        standby_p2p_port=args.standby_p2p_port,
+        proxy_url=args.proxy_url,
+        engine_url=args.engine_url,
+        watchdog=watchdog,
+    )
+
+    async def run_daemon() -> None:
+        await daemon.start()
+        stop_event = asyncio.Event()
+
+        def _signal_handler() -> None:
+            logger.info("Termination signal received. Draining resources...")
+            stop_event.set()
+
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                loop.add_signal_handler(sig, _signal_handler)
+            except (NotImplementedError, AttributeError):
+                signal.signal(sig, lambda *_: stop_event.set())
+
+        try:
+            await stop_event.wait()
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            pass
+        finally:
+            await daemon.stop()
+
+    try:
+        asyncio.run(run_daemon())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Node Daemon shutdown complete.")
+
+
+if __name__ == "__main__":
+    main()
+

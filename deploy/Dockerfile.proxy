@@ -1,0 +1,64 @@
+# ===========================================================================
+# SGM Ingress Proxy - Multi-Stage Production Container
+# Target Component: proxy.ingress
+# Base OS: Debian Bookworm (Python 3.12 Slim)
+# Security: Unprivileged execution under sgm:10001
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Stage 1: Build & Dependency Resolution
+# ---------------------------------------------------------------------------
+FROM python:3.12-slim-bookworm AS builder
+
+WORKDIR /build
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir --user -r requirements.txt uvloop
+
+# ---------------------------------------------------------------------------
+# Stage 2: High-Performance Production Proxy Runtime
+# ---------------------------------------------------------------------------
+FROM python:3.12-slim-bookworm AS runtime
+
+LABEL maintainer="SGM Technical Team <infra@spot-gpu-migrator.internal>"
+LABEL description="Spot GPU Migrator (SGM) Ingress Reverse Proxy"
+LABEL version="1.2.0"
+
+# Install curl and ca-certificates for healthchecks
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Security: Create non-root user and group
+RUN groupadd -g 10001 sgm && \
+    useradd -u 10001 -g sgm -s /sbin/nologin -M sgm
+
+WORKDIR /app
+
+# Copy installed python wheels from builder
+COPY --from=builder /root/.local /home/sgm/.local
+ENV PATH=/home/sgm/.local/bin:$PATH
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+# Copy proxy and daemon models/transport code
+COPY --chown=sgm:sgm proxy/ /app/proxy/
+COPY --chown=sgm:sgm daemon/ /app/daemon/
+
+USER sgm:sgm
+
+# Port 8000: OpenAI-compatible Ingress Entrypoint
+EXPOSE 8000
+
+# Healthcheck probing proxy health endpoint
+HEALTHCHECK --interval=3s --timeout=2s --start-period=2s --retries=3 \
+    CMD curl -f http://127.0.0.1:8000/health || exit 1
+
+ENTRYPOINT ["python", "-m", "proxy.ingress"]
+CMD ["--host", "0.0.0.0", "--port", "8000", "--active-upstream", "http://sgm-active-engine:8001", "--standby-upstream", "http://sgm-standby-engine:8002"]

@@ -1,7 +1,10 @@
 """
-Core module re-exporting NodeDaemon for daemon/core.py compatibility.
+Core module re-exporting NodeDaemon and main for daemon/core.py compatibility.
 """
 
-from daemon.core.node_daemon import NodeDaemon
+from daemon.core.node_daemon import NodeDaemon, main
 
-__all__ = ["NodeDaemon"]
+__all__ = ["NodeDaemon", "main"]
+
+if __name__ == "__main__":
+    main()

@@ -27,6 +27,7 @@ from daemon.models import (
     ClientDisconnectedError,
     MigrationHandoverError,
 )
+from daemon.core.vllm_hook import AbortResult, VLLMInferenceEngineHook
 
 __all__ = [
     "NodeLifecycleState",
@@ -52,4 +53,6 @@ __all__ = [
     "TokenSequenceGapError",
     "ClientDisconnectedError",
     "MigrationHandoverError",
+    "VLLMInferenceEngineHook",
+    "AbortResult",
 ]

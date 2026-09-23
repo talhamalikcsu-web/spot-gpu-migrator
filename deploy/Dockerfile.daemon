@@ -1,0 +1,66 @@
+# ===========================================================================
+# SGM Node Daemon - Multi-Stage Production Container
+# Target Component: daemon.core.node_daemon
+# Base OS: Debian Bookworm (Python 3.12 Slim)
+# Security: Unprivileged execution under sgm:10001
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Stage 1: Build & Dependency Wheel Cache
+# ---------------------------------------------------------------------------
+FROM python:3.12-slim-bookworm AS builder
+
+WORKDIR /build
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    curl \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir --user -r requirements.txt
+
+# ---------------------------------------------------------------------------
+# Stage 2: Minimal Distroless/Slim Production Runtime
+# ---------------------------------------------------------------------------
+FROM python:3.12-slim-bookworm AS runtime
+
+LABEL maintainer="SGM Technical Team <infra@spot-gpu-migrator.internal>"
+LABEL description="Spot GPU Migrator (SGM) Node Daemon & Preemption Watchdog"
+LABEL version="1.2.0"
+
+# Install curl and ca-certificates for container healthchecks and TLS
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Security: Create dedicated non-root user and group
+RUN groupadd -g 10001 sgm && \
+    useradd -u 10001 -g sgm -s /sbin/nologin -M sgm
+
+WORKDIR /app
+
+# Copy installed python wheels from builder stage
+COPY --from=builder /root/.local /home/sgm/.local
+ENV PATH=/home/sgm/.local/bin:$PATH
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+# Copy application source code
+COPY --chown=sgm:sgm daemon/ /app/daemon/
+COPY --chown=sgm:sgm specs/ /app/specs/
+
+USER sgm:sgm
+
+# Port 9001: Control REST API
+# Port 9002: P2P State Streaming Channel
+EXPOSE 9001 9002
+
+# Healthcheck probing daemon control endpoint
+HEALTHCHECK --interval=5s --timeout=2s --start-period=3s --retries=3 \
+    CMD curl -f http://127.0.0.1:9001/health || exit 1
+
+ENTRYPOINT ["python", "-m", "daemon.core.node_daemon"]
+CMD ["--role", "active", "--control-port", "9001", "--p2p-port", "9002"]

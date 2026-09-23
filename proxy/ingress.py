@@ -8,9 +8,12 @@ zero-downtime mid-stream socket handover on spot preemption.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 import logging
+import os
+import signal
 import time
 import uuid
 from typing import Any, AsyncIterator, Dict, List, Optional
@@ -340,3 +343,62 @@ class IngressProxy:
             await self._runner.cleanup()
             self._runner = None
         logger.info("SGM Ingress Proxy stopped.")
+
+
+def main() -> None:
+    """CLI and container entrypoint for SGM Ingress Reverse Proxy."""
+    parser = argparse.ArgumentParser(
+        prog="sgm-proxy",
+        description="Spot GPU Migrator (SGM) Ingress Reverse Proxy",
+    )
+    parser.add_argument("--host", default=os.environ.get("SGM_PROXY_HOST", "0.0.0.0"))
+    parser.add_argument("--port", type=int, default=int(os.environ.get("SGM_PROXY_PORT", "8000")))
+    parser.add_argument("--active-upstream", default=os.environ.get("SGM_ACTIVE_UPSTREAM_URL", "http://127.0.0.1:8001"))
+    parser.add_argument("--standby-upstream", default=os.environ.get("SGM_STANDBY_UPSTREAM_URL", "http://127.0.0.1:8002"))
+    parser.add_argument("--log-level", default=os.environ.get("SGM_LOG_LEVEL", "INFO"))
+
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper(), logging.INFO),
+        format="%(asctime)s [%(levelname)s] [%(name)s] %(message)s",
+    )
+
+    proxy = IngressProxy(
+        host=args.host,
+        port=args.port,
+        active_upstream_url=args.active_upstream,
+        standby_upstream_url=args.standby_upstream,
+    )
+
+    async def run_proxy() -> None:
+        await proxy.start()
+        stop_event = asyncio.Event()
+
+        def _signal_handler() -> None:
+            logger.info("Termination signal received. Shutting down Ingress Proxy...")
+            stop_event.set()
+
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                loop.add_signal_handler(sig, _signal_handler)
+            except (NotImplementedError, AttributeError):
+                signal.signal(sig, lambda *_: stop_event.set())
+
+        try:
+            await stop_event.wait()
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            pass
+        finally:
+            await proxy.stop()
+
+    try:
+        asyncio.run(run_proxy())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Proxy shutdown complete.")
+
+
+if __name__ == "__main__":
+    main()
+

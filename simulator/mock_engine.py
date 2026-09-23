@@ -56,6 +56,7 @@ class MockLLMEngine:
         app.router.add_post("/v1/chat/completions", self.handle_chat_completions)
         app.router.add_post("/v1/completions", self.handle_chat_completions)
         app.router.add_post("/pause", self.handle_pause)
+        app.router.add_post("/abort", self.handle_abort)
         app.router.add_post("/resume", self.handle_resume)
         app.router.add_get("/health", self.handle_health)
         return app
@@ -64,6 +65,13 @@ class MockLLMEngine:
         self.is_paused = True
         logger.info("Engine on port %d [%s] PAUSED", self.port, self.node_role)
         return web.json_response({"status": "paused"})
+
+    async def handle_abort(self, request: web.Request) -> web.Response:
+        self.is_paused = True
+        data = await request.json() if request.can_read_body else {}
+        req_id = data.get("request_id", "unknown")
+        logger.info("Engine on port %d [%s] ABORTED req=%s", self.port, self.node_role, req_id)
+        return web.json_response({"status": "aborted", "request_id": req_id})
 
     async def handle_resume(self, request: web.Request) -> web.Response:
         self.is_paused = False

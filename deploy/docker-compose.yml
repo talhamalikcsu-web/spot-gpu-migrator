@@ -1,0 +1,201 @@
+version: "3.8"
+
+networks:
+  sgm-ingress-net:
+    driver: bridge
+  sgm-cluster-internal-net:
+    driver: bridge
+    internal: false  # Allows watchdog to contact cloud IMDSv2 (169.254.169.254)
+
+volumes:
+  huggingface-cache:
+    driver: local
+
+services:
+  # =========================================================================
+  # 1. SGM Ingress Reverse Proxy
+  # =========================================================================
+  sgm-proxy:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.proxy
+    image: sgm-proxy:latest
+    container_name: sgm-proxy
+    restart: always
+    ports:
+      - "8000:8000"
+    environment:
+      - SGM_PROXY_PORT=8000
+      - SGM_ACTIVE_UPSTREAM_URL=http://sgm-active-engine:8001
+      - SGM_STANDBY_UPSTREAM_URL=http://sgm-standby-engine:8002
+      - SGM_LOG_LEVEL=INFO
+    networks:
+      - sgm-ingress-net
+      - sgm-cluster-internal-net
+    depends_on:
+      sgm-active-daemon:
+        condition: service_healthy
+      sgm-standby-daemon:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8000/health"]
+      interval: 3s
+      timeout: 2s
+      retries: 3
+
+  # =========================================================================
+  # 2. Active Spot Node: SGM Node Daemon
+  # =========================================================================
+  sgm-active-daemon:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.daemon
+    image: sgm-daemon:latest
+    container_name: sgm-active-daemon
+    restart: unless-stopped
+    ports:
+      - "9001:9001"
+    environment:
+      - SGM_NODE_ID=spot-node-active-01
+      - SGM_ROLE=active
+      - SGM_CONTROL_PORT=9001
+      - SGM_P2P_PORT=9002
+      - SGM_STANDBY_HOST=sgm-standby-daemon
+      - SGM_STANDBY_P2P_PORT=9002
+      - SGM_PROXY_URL=http://sgm-proxy:8000
+      - SGM_ENGINE_URL=http://sgm-active-engine:8001
+      - SGM_CLOUD_PROVIDER=aws
+      - SGM_METADATA_URL=http://cloud-simulator:18000
+      - SGM_LOG_LEVEL=INFO
+    networks:
+      - sgm-cluster-internal-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9001/health"]
+      interval: 3s
+      timeout: 2s
+      retries: 3
+
+  # =========================================================================
+  # 3. Active Spot Node: vLLM Inference Engine
+  # =========================================================================
+  sgm-active-engine:
+    image: vllm/vllm-openai:latest
+    container_name: sgm-active-engine
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    volumes:
+      - huggingface-cache:/root/.cache/huggingface
+    environment:
+      - MODEL=meta-llama/Llama-3-8b-instruct
+      - PORT=8001
+      - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-}
+    command: >
+      --model meta-llama/Llama-3-8b-instruct
+      --port 8001
+      --host 0.0.0.0
+      --enable-prefix-caching
+      --block-size 16
+      --gpu-memory-utilization 0.90
+      --max-model-len 4096
+      --disable-log-requests
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    networks:
+      - sgm-cluster-internal-net
+
+  # =========================================================================
+  # 4. Standby Spot Node: SGM Node Daemon
+  # =========================================================================
+  sgm-standby-daemon:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.daemon
+    image: sgm-daemon:latest
+    container_name: sgm-standby-daemon
+    restart: unless-stopped
+    ports:
+      - "9003:9003"
+      - "9002:9002"
+    environment:
+      - SGM_NODE_ID=spot-node-standby-02
+      - SGM_ROLE=standby
+      - SGM_CONTROL_PORT=9003
+      - SGM_P2P_PORT=9002
+      - SGM_STANDBY_HOST=sgm-standby-daemon
+      - SGM_STANDBY_P2P_PORT=9002
+      - SGM_PROXY_URL=http://sgm-proxy:8000
+      - SGM_ENGINE_URL=http://sgm-standby-engine:8002
+      - SGM_CLOUD_PROVIDER=aws
+      - SGM_METADATA_URL=http://cloud-simulator:18000
+      - SGM_LOG_LEVEL=INFO
+    networks:
+      - sgm-cluster-internal-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9003/health"]
+      interval: 3s
+      timeout: 2s
+      retries: 3
+
+  # =========================================================================
+  # 5. Standby Spot Node: vLLM Inference Engine (Warm Target)
+  # =========================================================================
+  sgm-standby-engine:
+    image: vllm/vllm-openai:latest
+    container_name: sgm-standby-engine
+    restart: unless-stopped
+    ports:
+      - "8002:8002"
+    volumes:
+      - huggingface-cache:/root/.cache/huggingface
+    environment:
+      - MODEL=meta-llama/Llama-3-8b-instruct
+      - PORT=8002
+      - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-}
+    command: >
+      --model meta-llama/Llama-3-8b-instruct
+      --port 8002
+      --host 0.0.0.0
+      --enable-prefix-caching
+      --block-size 16
+      --gpu-memory-utilization 0.90
+      --max-model-len 4096
+      --disable-log-requests
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    networks:
+      - sgm-cluster-internal-net
+
+  # =========================================================================
+  # 6. Cloud Chaos Simulator (Mock IMDSv2 & Webhook Injector)
+  # =========================================================================
+  cloud-simulator:
+    image: python:3.12-slim-bookworm
+    container_name: cloud-simulator
+    restart: unless-stopped
+    ports:
+      - "18000:18000"
+    working_dir: /app
+    volumes:
+      - ../simulator:/app/simulator
+      - ../daemon:/app/daemon
+      - ../requirements.txt:/app/requirements.txt
+    command: >
+      bash -c "pip install --no-cache-dir -r requirements.txt && python -m simulator.server --port 18000"
+    networks:
+      - sgm-cluster-internal-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:18000/health"]
+      interval: 3s
+      timeout: 2s
+      retries: 3
