@@ -1,0 +1,3 @@
+"""
+SGM Automated Test Suite.
+"""
