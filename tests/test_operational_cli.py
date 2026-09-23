@@ -23,7 +23,15 @@ from cli import (
     generate_runpod_provisioning_script,
     run_provision_command,
 )
-from ui.dashboard import ClusterMonitor, DashboardState, SGMDashboard
+from daemon.core.node_daemon import NodeDaemon
+from ui.dashboard import (
+    ClusterMonitor,
+    DashboardState,
+    NodeTelemetry,
+    SGMDashboard,
+    format_engine_badge,
+    normalize_engine_name,
+)
 
 
 class TestProvisioningCLI:
@@ -265,3 +273,144 @@ class TestMonitorCLI:
         finally:
             await proxy_runner.cleanup()
             await daemon_runner.cleanup()
+
+
+class TestUniversalEngineDashboardAndCLI:
+    """Test suite for universal inference engine integrations in CLI and UI dashboard."""
+
+    def test_node_telemetry_engine_type(self):
+        """Validates that NodeTelemetry includes engine_type and defaults to vLLM."""
+        node = NodeTelemetry(
+            node_id="test-node-1",
+            role="ACTIVE",
+            provider="AWS (p4de.24xlarge)",
+            status="HEALTHY",
+            control_port=9001,
+            p2p_port=9002,
+            engine_port=8001,
+            memory_info="80 GB VRAM",
+        )
+        assert node.engine_type == "vLLM"
+
+        # Explicit engine types
+        node_trt = NodeTelemetry(
+            node_id="test-node-2",
+            role="ACTIVE",
+            provider="AWS (p4de.24xlarge)",
+            status="HEALTHY",
+            control_port=9001,
+            p2p_port=9002,
+            engine_port=8001,
+            memory_info="80 GB VRAM",
+            engine_type="TensorRT-LLM",
+        )
+        assert node_trt.engine_type == "TensorRT-LLM"
+
+        node_tgi = NodeTelemetry(
+            node_id="test-node-3",
+            role="STANDBY",
+            provider="GCP (a2-highgpu-8g)",
+            status="HEALTHY",
+            control_port=9003,
+            p2p_port=9002,
+            engine_port=8002,
+            memory_info="80 GB VRAM",
+            engine_type="HuggingFace TGI",
+        )
+        assert node_tgi.engine_type == "HuggingFace TGI"
+
+    def test_engine_badge_formatting(self):
+        """Validates that format_engine_badge applies expected Rich markup."""
+        assert "vLLM" in format_engine_badge("vllm")
+        assert "TRT-LLM" in format_engine_badge("tensorrt_llm")
+        assert "TRT-LLM" in format_engine_badge("trt")
+        assert "HF-TGI" in format_engine_badge("tgi")
+        assert "SGLang" in format_engine_badge("sglang")
+        assert "Mock" in format_engine_badge("mock")
+        assert "Auto-Detect" in format_engine_badge("auto")
+
+    def test_normalize_engine_name(self):
+        """Validates canonical naming for supported engine backends."""
+        assert normalize_engine_name("vllm") == "vLLM"
+        assert normalize_engine_name("tensorrt_llm") == "TensorRT-LLM"
+        assert normalize_engine_name("tgi") == "HuggingFace TGI"
+        assert normalize_engine_name("sglang") == "SGLang"
+        assert normalize_engine_name("mock") == "Mock Engine"
+        assert normalize_engine_name("auto") == "Auto-Detect"
+
+    def test_dashboard_renders_engine_in_header_and_table(self):
+        """Validates that SGMDashboard displays engine in header and nodes table."""
+        dashboard = SGMDashboard()
+        dashboard.state.set_engine_type("tensorrt_llm")
+
+        # Verify header rendering
+        header_panel = dashboard._render_header()
+        header_text = str(header_panel.renderable)
+        assert "TRT-LLM" in header_text or "Engine:" in header_text
+
+        # Verify nodes table rendering
+        table_panel = dashboard._render_nodes_table()
+        table = table_panel.renderable
+        col_names = [col.header for col in table.columns]
+        assert "Engine" in col_names
+
+    def test_cli_argument_parsers_support_engine_type(self):
+        """Validates that cli.py subparsers accept --engine-type with valid choices."""
+        import subprocess
+
+        for cmd in ["demo", "status", "monitor"]:
+            proc = subprocess.run(
+                [sys.executable, "cli.py", cmd, "--help"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            assert "--engine-type" in proc.stdout
+            assert "tensorrt_llm" in proc.stdout
+            assert "tgi" in proc.stdout
+            assert "sglang" in proc.stdout
+
+    @pytest.mark.asyncio
+    async def test_cluster_monitor_engine_type_propagation(self):
+        """Validates that ClusterMonitor propagates engine_type to dashboard and nodes."""
+        dashboard = SGMDashboard()
+        monitor = ClusterMonitor(
+            proxy_url="http://127.0.0.1:59990",
+            engine_type="tgi",
+            poll_interval=0.1,
+            dashboard=dashboard,
+        )
+        assert monitor.dashboard.state.engine_type == "HuggingFace TGI"
+
+    @pytest.mark.asyncio
+    async def test_node_daemon_engine_type_api(self):
+        """Validates that NodeDaemon accepts engine_type and exposes it on /health and /status."""
+        daemon = NodeDaemon(
+            node_id="test-engine-node",
+            role="active",
+            control_port=0,
+            p2p_port=0,
+            engine_type="tensorrt_llm",
+        )
+        app = daemon._setup_routes()
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = list(site._server.sockets)[0].getsockname()[1]
+
+        import aiohttp
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f"http://127.0.0.1:{port}/health") as resp:
+                    assert resp.status == 200
+                    data = await resp.json()
+                    assert data["engine_type"] == "tensorrt_llm"
+
+                async with session.get(f"http://127.0.0.1:{port}/status") as resp:
+                    assert resp.status == 200
+                    data = await resp.json()
+                    assert data["engine_type"] == "tensorrt_llm"
+        finally:
+            await runner.cleanup()
+

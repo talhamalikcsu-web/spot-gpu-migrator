@@ -32,6 +32,7 @@ from daemon.models import (
     SGMError,
 )
 from daemon.integrations.base import AbstractInferenceEngineHook
+from daemon.integrations.factory import EngineHookFactory
 from daemon.integrations.vllm import VLLMInferenceEngineHook
 from daemon.transport.p2p_client import P2PClient
 from daemon.transport.p2p_server import P2PServer
@@ -57,6 +58,7 @@ class NodeDaemon:
         watchdog: Optional[AbstractPreemptionWatchdog] = None,
         engine_url: str = "http://127.0.0.1:8001",
         engine_hook: Optional[AbstractInferenceEngineHook] = None,
+        engine_type: Optional[str] = "auto",
     ) -> None:
         self.node_id = node_id
         self.role = role.lower()
@@ -67,7 +69,15 @@ class NodeDaemon:
         self.proxy_url = proxy_url.rstrip("/")
         self.engine_url = engine_url.rstrip("/")
         self.watchdog = watchdog
-        self.engine_hook = engine_hook or VLLMInferenceEngineHook(base_url=self.engine_url)
+        self.engine_type = (engine_type or "auto").lower()
+        self._custom_engine_hook = engine_hook is not None
+        if self._custom_engine_hook:
+            self.engine_hook = engine_hook
+        elif self.engine_type != "auto":
+            self.engine_hook = EngineHookFactory.create_sync(self.engine_type, engine_url=self.engine_url)
+        else:
+            self.engine_hook = VLLMInferenceEngineHook(base_url=self.engine_url)
+
 
         # FSM State
         self.state: NodeLifecycleState = NodeLifecycleState.HEALTHY
@@ -328,6 +338,7 @@ class NodeDaemon:
             "node_id": self.node_id,
             "role": self.role,
             "state": self.state.value,
+            "engine_type": self.engine_type,
         })
 
     async def _handle_status(self, request: web.Request) -> web.Response:
@@ -335,6 +346,7 @@ class NodeDaemon:
             "node_id": self.node_id,
             "role": self.role,
             "state": self.state.value,
+            "engine_type": self.engine_type,
             "active_sessions_count": len(self.active_sessions),
             "sessions": list(self.active_sessions.keys()),
         })
@@ -367,6 +379,14 @@ class NodeDaemon:
 
     async def start(self) -> None:
         """Starts the Node Daemon control server, P2P server (if Standby), and watchdog."""
+        if not self._custom_engine_hook and self.engine_type == "auto":
+            try:
+                self.engine_hook = await EngineHookFactory.create("auto", engine_url=self.engine_url)
+                logger.info("Node Daemon engine hook auto-configured: %s", type(self.engine_hook).__name__)
+            except Exception as exc:
+                logger.warning("Engine auto-detection failed (%s), defaulting to vLLM", exc)
+                self.engine_hook = VLLMInferenceEngineHook(base_url=self.engine_url)
+
         self._app = self._setup_routes()
         self._runner = web.AppRunner(self._app)
         await self._runner.setup()
@@ -404,6 +424,8 @@ def main() -> None:
     parser.add_argument("--standby-p2p-port", type=int, default=int(os.environ.get("SGM_STANDBY_P2P_PORT", "9002")))
     parser.add_argument("--proxy-url", default=os.environ.get("SGM_PROXY_URL", "http://127.0.0.1:8000"))
     parser.add_argument("--engine-url", default=os.environ.get("SGM_ENGINE_URL", "http://127.0.0.1:8001"))
+    parser.add_argument("--engine-type", default=os.environ.get("SGM_ENGINE_TYPE", "auto"), choices=["vllm", "tensorrt_llm", "tgi", "sglang", "mock", "auto"])
+
     parser.add_argument("--cloud-provider", default=os.environ.get("SGM_CLOUD_PROVIDER", "aws"), choices=["aws", "gcp", "runpod", "mock", "none"])
     parser.add_argument("--metadata-url", default=os.environ.get("SGM_METADATA_URL", None))
     parser.add_argument("--poll-interval-ms", type=int, default=int(os.environ.get("SGM_POLL_INTERVAL_MS", "250")))
@@ -452,6 +474,7 @@ def main() -> None:
         proxy_url=args.proxy_url,
         engine_url=args.engine_url,
         watchdog=watchdog,
+        engine_type=args.engine_type,
     )
 
     async def run_daemon() -> None:

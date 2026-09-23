@@ -45,6 +45,44 @@ from rich.text import Text
 # Telemetry Data Models
 # ---------------------------------------------------------------------------
 
+def format_engine_badge(engine_type: str) -> str:
+    """Formats engine type into a styled Rich markup badge."""
+    eng_lower = engine_type.lower().replace("-", "_").replace(" ", "_")
+    if "trt" in eng_lower or "tensorrt" in eng_lower:
+        return "[bold cyan]TRT-LLM[/bold cyan]"
+    elif "tgi" in eng_lower or "huggingface" in eng_lower:
+        return "[bold yellow]HF-TGI[/bold yellow]"
+    elif "sglang" in eng_lower:
+        return "[bold magenta]SGLang[/bold magenta]"
+    elif "mock" in eng_lower:
+        return "[bold white]Mock[/bold white]"
+    elif "auto" in eng_lower:
+        return "[bold bright_blue]Auto-Detect[/bold bright_blue]"
+    elif "vllm" in eng_lower:
+        return "[bold green]vLLM[/bold green]"
+    else:
+        return f"[bold green]{engine_type}[/bold green]"
+
+
+def normalize_engine_name(engine_type: str) -> str:
+    """Normalizes raw engine string to standard display representation."""
+    eng_lower = engine_type.lower().replace("-", "_").replace(" ", "_")
+    if "trt" in eng_lower or "tensorrt" in eng_lower:
+        return "TensorRT-LLM"
+    elif "tgi" in eng_lower or "huggingface" in eng_lower:
+        return "HuggingFace TGI"
+    elif "sglang" in eng_lower:
+        return "SGLang"
+    elif "mock" in eng_lower:
+        return "Mock Engine"
+    elif "auto" in eng_lower:
+        return "Auto-Detect"
+    elif "vllm" in eng_lower:
+        return "vLLM"
+    else:
+        return engine_type
+
+
 @dataclass
 class NodeTelemetry:
     """Telemetry data representing a single GPU cluster node."""
@@ -56,6 +94,7 @@ class NodeTelemetry:
     p2p_port: int           # e.g. 9002
     engine_port: int        # e.g. 8001
     memory_info: str        # e.g. "80 GB (32.4 GB VRAM)"
+    engine_type: str = "vLLM"  # e.g. "TensorRT-LLM", "vLLM", "HuggingFace TGI", "SGLang"
     active_streams: int = 0
     tokens_generated: int = 0
     gpu_util_pct: float = 0.0
@@ -138,6 +177,7 @@ class DashboardState:
         self.boot_time = datetime.now(timezone.utc)
         self.cluster_status: str = "OPERATIONAL"  # OPERATIONAL, PREEMPTING, MIGRATING, RESUMED
         self.mode: str = "SIMULATION (AWS IMDSv2)"
+        self.engine_type: str = "vLLM"
         self.ingress_url: str = "http://127.0.0.1:8000"
         self.active_upstream_url: str = "http://127.0.0.1:8001"
 
@@ -152,6 +192,7 @@ class DashboardState:
                 p2p_port=9002,
                 engine_port=8001,
                 memory_info="80 GB (34.2 GB VRAM)",
+                engine_type="vLLM",
                 active_streams=1,
                 tokens_generated=0,
                 gpu_util_pct=88.5,
@@ -165,6 +206,7 @@ class DashboardState:
                 p2p_port=9002,
                 engine_port=8002,
                 memory_info="80 GB (Warmed Weights)",
+                engine_type="vLLM",
                 active_streams=0,
                 tokens_generated=0,
                 gpu_util_pct=12.0,
@@ -181,11 +223,18 @@ class DashboardState:
         self.logs: List[LogEvent] = []
         self._init_default_logs()
 
+    def set_engine_type(self, engine_type: str) -> None:
+        """Sets the active engine type across dashboard state and default nodes."""
+        norm = normalize_engine_name(engine_type)
+        self.engine_type = norm
+        for node in self.nodes.values():
+            node.engine_type = norm
+
     def _init_default_logs(self) -> None:
         now_str = datetime.now().strftime("%H:%M:%S")
         self.logs.extend([
             LogEvent(now_str, "INFO", "SGM Ingress Proxy online on port 8000 (OpenAI SSE gateway)"),
-            LogEvent(now_str, "INFO", "Active spot node spot-node-us-east-1a connected [vLLM :8001]"),
+            LogEvent(now_str, "INFO", f"Active spot node spot-node-us-east-1a connected [{self.engine_type} :8001]"),
             LogEvent(now_str, "INFO", "Standby spot node spot-node-us-east-1b warm & ready [P2P :9002]"),
             LogEvent(now_str, "INFO", "Hypervisor Watchdog active: polling AWS IMDSv2 @ 250ms"),
         ])
@@ -287,10 +336,19 @@ class SGMDashboard:
             ("[bold white on red] 🔴 UNKNOWN [/bold white on red]", "red")
         )
 
+        # Active engine backend
+        active_engine = self.state.engine_type or "vLLM"
+        for node in self.state.nodes.values():
+            if node.role.upper() == "ACTIVE" and node.engine_type:
+                active_engine = node.engine_type
+                break
+        engine_badge = format_engine_badge(active_engine)
+
         title_text = Text.from_markup(
             f"[bold bright_cyan]⚡ SPOT GPU MIGRATOR (SGM)[/bold bright_cyan]  "
             f"[dim]|[/dim]  [bold bright_white]Zero-Downtime Live Migration Daemon[/bold bright_white]\n"
             f"Cluster Status: {status_badge}  "
+            f"[dim]|[/dim]  Engine: {engine_badge}  "
             f"[dim]|[/dim]  Uptime: [bold bright_yellow]{self.state.uptime_str}[/bold bright_yellow]  "
             f"[dim]|[/dim]  Mode: [bold cyan]{self.state.mode}[/bold cyan]  "
             f"[dim]|[/dim]  Ingress: [bold green]{self.state.ingress_url}[/bold green]"
@@ -303,7 +361,7 @@ class SGMDashboard:
         )
 
     def _render_nodes_table(self) -> Panel:
-        """Renders the active vs standby cluster nodes table."""
+        """Renders the active vs standby cluster nodes table with engine badge."""
         table = Table(
             expand=True,
             box=None,
@@ -313,6 +371,7 @@ class SGMDashboard:
         )
         table.add_column("Node ID", style="bright_white", no_wrap=True)
         table.add_column("Role", justify="center", no_wrap=True)
+        table.add_column("Engine", justify="center", no_wrap=True)
         table.add_column("Provider / Spec", style="bright_blue", no_wrap=True)
         table.add_column("Status", justify="center", no_wrap=True)
         table.add_column("Ports", justify="center", style="yellow")
@@ -344,12 +403,14 @@ class SGMDashboard:
 
         for node in self.state.nodes.values():
             role_badge = role_badge_map.get(node.role.upper(), f"[bold]{node.role}[/bold]")
+            engine_badge = format_engine_badge(node.engine_type)
             status_text = status_color_map.get(node.status.upper(), f"[white]{node.status}[/white]")
             port_info = f":{node.control_port} | P2P:{node.p2p_port}"
 
             table.add_row(
                 node.node_id,
                 role_badge,
+                engine_badge,
                 node.provider,
                 status_text,
                 port_info,
@@ -571,6 +632,7 @@ class SGMDashboard:
         node_id: str,
         role: Optional[str] = None,
         status: Optional[str] = None,
+        engine_type: Optional[str] = None,
         active_streams: Optional[int] = None,
         tokens_generated: Optional[int] = None,
         gpu_util_pct: Optional[float] = None,
@@ -582,6 +644,8 @@ class SGMDashboard:
                 node.role = role
             if status is not None:
                 node.status = status
+            if engine_type is not None:
+                node.engine_type = normalize_engine_name(engine_type)
             if active_streams is not None:
                 node.active_streams = active_streams
             if tokens_generated is not None:
@@ -716,6 +780,7 @@ class SGMDashboard:
         proxy_url: str = "http://127.0.0.1:8000",
         active_daemon_url: Optional[str] = None,
         standby_daemon_url: Optional[str] = None,
+        engine_type: str = "auto",
         poll_interval: float = 1.0,
         max_iterations: Optional[int] = None,
     ) -> None:
@@ -724,6 +789,7 @@ class SGMDashboard:
             proxy_url=proxy_url,
             active_daemon_url=active_daemon_url,
             standby_daemon_url=standby_daemon_url,
+            engine_type=engine_type,
             poll_interval=poll_interval,
             dashboard=self,
             console=self.console,
@@ -748,6 +814,7 @@ class ClusterMonitor:
         proxy_url: str = "http://127.0.0.1:8000",
         active_daemon_url: Optional[str] = None,
         standby_daemon_url: Optional[str] = None,
+        engine_type: str = "auto",
         poll_interval: float = 1.0,
         on_demand_rate: float = 32.77,
         spot_rate: float = 9.83,
@@ -757,11 +824,14 @@ class ClusterMonitor:
         self.proxy_url = self._normalize_url(proxy_url)
         self.active_daemon_url = self._normalize_url(active_daemon_url) if active_daemon_url else None
         self.standby_daemon_url = self._normalize_url(standby_daemon_url) if standby_daemon_url else None
+        self.engine_type = engine_type
         self.poll_interval = max(0.1, poll_interval)
         self.console = console or Console()
         self.dashboard = dashboard or SGMDashboard(console=self.console)
 
         # Configure dashboard state
+        if self.engine_type != "auto":
+            self.dashboard.state.set_engine_type(self.engine_type)
         self.dashboard.state.financial.on_demand_rate_hourly = on_demand_rate
         self.dashboard.state.financial.spot_rate_hourly = spot_rate
         self.dashboard.state.ingress_url = self.proxy_url
@@ -958,6 +1028,19 @@ class ClusterMonitor:
             st_state = "DISCONNECTED" if not self.proxy_online else "READY"
             st_streams = 0
 
+        # Determine engine type
+        act_engine = (
+            active_daemon_data.get("engine_type")
+            if active_daemon_data and active_daemon_data.get("engine_type")
+            else (normalize_engine_name(self.engine_type) if self.engine_type != "auto" else "vLLM")
+        )
+        st_engine = (
+            standby_daemon_data.get("engine_type")
+            if standby_daemon_data and standby_daemon_data.get("engine_type")
+            else (normalize_engine_name(self.engine_type) if self.engine_type != "auto" else "vLLM")
+        )
+        state.engine_type = act_engine
+
         # Retain or update existing node definitions
         if active_id not in state.nodes:
             for k in list(state.nodes.keys()):
@@ -973,6 +1056,7 @@ class ClusterMonitor:
             p2p_port=9002,
             engine_port=8001,
             memory_info="80 GB VRAM",
+            engine_type=act_engine,
             active_streams=act_streams,
         )
 
@@ -990,6 +1074,7 @@ class ClusterMonitor:
             p2p_port=9002,
             engine_port=8002,
             memory_info="80 GB (Warmed)",
+            engine_type=st_engine,
             active_streams=st_streams,
         )
 

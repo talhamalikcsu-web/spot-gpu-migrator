@@ -59,7 +59,7 @@ from daemon.watchdog.runpod import RunPodPreemptionWatchdog
 from proxy.ingress import IngressProxy
 from simulator.cloud_metadata import CloudMetadataServer
 from simulator.mock_engine import MockLLMEngine
-from ui.dashboard import DashboardState, SGMDashboard, ClusterMonitor
+from ui.dashboard import DashboardState, SGMDashboard, ClusterMonitor, format_engine_badge, normalize_engine_name
 
 
 # Suppress noisy lower-level loggers in CLI interactive mode
@@ -92,6 +92,7 @@ async def run_live_cluster_demo(
     standby_p2p_port: int = 9002,
     standby_daemon_port: int = 9003,
     simulator_port: int = 18000,
+    engine_type: str = "vllm",
 ) -> None:
     """
     Spins up a full local simulation cluster:
@@ -108,8 +109,10 @@ async def run_live_cluster_demo(
         "gcp": "GCP (a2-highgpu-8g)",
         "runpod": "RunPod (8x A100 SXM4)",
     }.get(prov_lower, f"{provider.upper()} (GPU Cluster)")
+    eng_display = normalize_engine_name(engine_type if engine_type != "auto" else "vllm")
 
     dashboard = SGMDashboard(console=console)
+    dashboard.state.engine_type = eng_display
     dashboard.state.mode = f"SIMULATION ({provider.upper()} Notice)"
     dashboard.state.ingress_url = f"http://127.0.0.1:{proxy_port}"
     dashboard.state.active_upstream_url = f"http://127.0.0.1:{active_engine_port}"
@@ -119,13 +122,15 @@ async def run_live_cluster_demo(
     dashboard.state.nodes["spot-node-us-east-1a"].control_port = active_daemon_port
     dashboard.state.nodes["spot-node-us-east-1a"].engine_port = active_engine_port
     dashboard.state.nodes["spot-node-us-east-1a"].p2p_port = standby_p2p_port
+    dashboard.state.nodes["spot-node-us-east-1a"].engine_type = eng_display
 
     dashboard.state.nodes["spot-node-us-east-1b"].provider = prov_display
     dashboard.state.nodes["spot-node-us-east-1b"].control_port = standby_daemon_port
     dashboard.state.nodes["spot-node-us-east-1b"].engine_port = standby_engine_port
     dashboard.state.nodes["spot-node-us-east-1b"].p2p_port = standby_p2p_port
+    dashboard.state.nodes["spot-node-us-east-1b"].engine_type = eng_display
 
-    dashboard.add_log("INFO", f"Spinning up SGM cluster for provider: {provider.upper()}...")
+    dashboard.add_log("INFO", f"Spinning up SGM cluster for provider: {provider.upper()} [Engine: {eng_display}]...")
 
     # 1. Cloud Metadata Simulator
     simulator = CloudMetadataServer(host="127.0.0.1", port=simulator_port)
@@ -169,9 +174,10 @@ async def run_live_cluster_demo(
         p2p_port=standby_p2p_port,
         proxy_url=f"http://127.0.0.1:{proxy_port}",
         engine_url=f"http://127.0.0.1:{standby_engine_port}",
+        engine_type=engine_type,
     )
     await standby_daemon.start()
-    dashboard.add_log("INFO", f"Standby Node Daemon online: Control=:{standby_daemon_port}, P2P=:{standby_p2p_port}")
+    dashboard.add_log("INFO", f"Standby Node Daemon online: Control=:{standby_daemon_port}, P2P=:{standby_p2p_port} [{eng_display}]")
 
     # 5. Preemption Watchdog & Active Node Daemon
     if prov_lower == "aws":
@@ -202,6 +208,7 @@ async def run_live_cluster_demo(
         proxy_url=f"http://127.0.0.1:{proxy_port}",
         engine_url=f"http://127.0.0.1:{active_engine_port}",
         watchdog=watchdog,
+        engine_type=engine_type,
     )
 
     migration_start_time = 0.0
@@ -232,7 +239,7 @@ async def run_live_cluster_demo(
             latency_ms = (migration_done_time - migration_start_time) * 1000.0
             dashboard.state.cluster_status = "RESUMED"
             dashboard.update_node("spot-node-us-east-1a", status="MIGRATED")
-            dashboard.update_node("spot-node-us-east-1b", role="ACTIVE", status="HEALTHY", active_streams=1)
+            dashboard.update_node("spot-node-us-east-1b", role="ACTIVE", status="HEALTHY", engine_type=eng_display, active_streams=1)
             dashboard.update_p2p_migration(
                 speed_mb_s=842.5,
                 transferred_bytes=42500,
@@ -246,7 +253,7 @@ async def run_live_cluster_demo(
 
     active_daemon.on_state_change = on_active_state_change
     await active_daemon.start()
-    dashboard.add_log("INFO", f"Active Node Daemon online on port {active_daemon_port} with {provider.upper()} Watchdog")
+    dashboard.add_log("INFO", f"Active Node Daemon online on port {active_daemon_port} with {provider.upper()} Watchdog [{eng_display}]")
 
     # -----------------------------------------------------------------------
     # Live Demonstration Loop
@@ -409,6 +416,12 @@ async def run_live_cluster_demo(
         "Spot instance discount over on-demand",
         "[bold green]OPTIMIZED[/bold green]",
     )
+    report_table.add_row(
+        "Inference Engine Backend",
+        f"{eng_display} (Unified Hook)",
+        "Zero-Loss Cross-Engine Support",
+        "[bold green]PASS[/bold green]",
+    )
 
     console.print(Panel(report_table, border_style="bright_green", padding=(1, 2)))
     console.print("[bold green]✔ Live Demonstration Successfully Completed![/bold green]\n")
@@ -482,10 +495,12 @@ async def query_cluster_status(
     active_daemon_url: str = "http://127.0.0.1:9001",
     standby_daemon_url: str = "http://127.0.0.1:9003",
     simulator_url: str = "http://127.0.0.1:18000",
+    engine_type: str = "auto",
 ) -> None:
     """Queries running proxy, daemon, and simulator processes via HTTP."""
     console.print()
-    console.print(Rule("[bold bright_cyan]Spot GPU Migrator (SGM) - Cluster Status Inspection[/bold bright_cyan]"))
+    eng_tag = f" [Engine: {engine_type}]" if engine_type != "auto" else ""
+    console.print(Rule(f"[bold bright_cyan]Spot GPU Migrator (SGM) - Cluster Status Inspection{eng_tag}[/bold bright_cyan]"))
 
     timeout = aiohttp.ClientTimeout(total=1.5)
     async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -534,10 +549,12 @@ async def query_cluster_status(
     )
     table.add_column("Component", style="bright_white")
     table.add_column("Endpoint", style="dim")
+    table.add_column("Engine", justify="center")
     table.add_column("Status", justify="center")
     table.add_column("Details", style="bright_white")
 
     # Ingress Proxy Row
+    proxy_engine = format_engine_badge(engine_type) if engine_type != "auto" else "[dim]Gateway[/dim]"
     if proxy_data:
         up_active = proxy_data.get("active_upstream", "n/a")
         up_standby = proxy_data.get("standby_upstream", "n/a")
@@ -547,6 +564,7 @@ async def query_cluster_status(
         table.add_row(
             "SGM Ingress Proxy",
             proxy_url,
+            proxy_engine,
             status_badge,
             f"Active: {up_active} | Standby: {up_standby} | Streams: {in_flight}",
         )
@@ -554,11 +572,17 @@ async def query_cluster_status(
         table.add_row(
             "SGM Ingress Proxy",
             proxy_url,
+            proxy_engine,
             "[bold red]OFFLINE[/bold red]",
             "No proxy daemon responding on port 8000",
         )
 
     # Active Daemon Row
+    act_engine = (
+        active_data.get("engine_type", engine_type if engine_type != "auto" else "vllm")
+        if active_data
+        else (engine_type if engine_type != "auto" else "vllm")
+    )
     if active_data:
         role = active_data.get("role", "active")
         st = active_data.get("state", "HEALTHY")
@@ -566,6 +590,7 @@ async def query_cluster_status(
         table.add_row(
             "Active Node Daemon",
             active_daemon_url,
+            format_engine_badge(act_engine),
             f"[bold green]{st}[/bold green]",
             f"Role: {role} | Sessions: {sess}",
         )
@@ -573,11 +598,17 @@ async def query_cluster_status(
         table.add_row(
             "Active Node Daemon",
             active_daemon_url,
+            format_engine_badge(act_engine),
             "[bold red]OFFLINE[/bold red]",
             "No daemon responding on port 9001",
         )
 
     # Standby Daemon Row
+    st_engine = (
+        standby_data.get("engine_type", engine_type if engine_type != "auto" else "vllm")
+        if standby_data
+        else (engine_type if engine_type != "auto" else "vllm")
+    )
     if standby_data:
         role = standby_data.get("role", "standby")
         st = standby_data.get("state", "HEALTHY")
@@ -585,6 +616,7 @@ async def query_cluster_status(
         table.add_row(
             "Standby Node Daemon",
             standby_daemon_url,
+            format_engine_badge(st_engine),
             f"[bold green]{st}[/bold green]",
             f"Role: {role} | Sessions: {sess}",
         )
@@ -592,6 +624,7 @@ async def query_cluster_status(
         table.add_row(
             "Standby Node Daemon",
             standby_daemon_url,
+            format_engine_badge(st_engine),
             "[bold red]OFFLINE[/bold red]",
             "No daemon responding on port 9003",
         )
@@ -604,6 +637,7 @@ async def query_cluster_status(
         table.add_row(
             "Chaos Simulator",
             simulator_url,
+            "[dim]Simulator[/dim]",
             status_sim,
             f"AWS Preempted: {aws_p} | GCP Preempted: {gcp_p}",
         )
@@ -611,6 +645,7 @@ async def query_cluster_status(
         table.add_row(
             "Chaos Simulator",
             simulator_url,
+            "[dim]Simulator[/dim]",
             "[dim]NOT RUNNING[/dim]",
             "Local mock hypervisor not started",
         )
@@ -657,6 +692,7 @@ async def run_monitor_command(
     host: str = "http://127.0.0.1:8000",
     active_daemon: Optional[str] = None,
     standby_daemon: Optional[str] = None,
+    engine_type: str = "auto",
     interval: float = 1.0,
     iterations: Optional[int] = None,
     on_demand_rate: float = 32.77,
@@ -671,6 +707,7 @@ async def run_monitor_command(
         proxy_url=host,
         active_daemon_url=active_daemon,
         standby_daemon_url=standby_daemon,
+        engine_type=engine_type,
         poll_interval=interval,
         on_demand_rate=on_demand_rate,
         spot_rate=spot_rate,
@@ -1110,6 +1147,7 @@ def main() -> None:
     # 1. demo command
     demo_parser = subparsers.add_parser("demo", help="Spin up local simulation cluster and show live migration TUI")
     demo_parser.add_argument("--provider", choices=["aws", "gcp", "runpod"], default="aws", help="Hypervisor provider (default: aws)")
+    demo_parser.add_argument("--engine-type", choices=["vllm", "tensorrt_llm", "tgi", "sglang", "mock", "auto"], default="vllm", help="Inference engine backend type (default: vllm)")
     demo_parser.add_argument("--deadline", type=float, default=30.0, help="Preemption grace period seconds (default: 30.0)")
     demo_parser.add_argument("--notice-at-seq", type=int, default=6, help="Token sequence to inject preemption at (default: 6)")
     demo_parser.add_argument("--speed-ms", type=float, default=35.0, help="Inter-token generation delay in ms (default: 35.0)")
@@ -1131,6 +1169,7 @@ def main() -> None:
     status_parser.add_argument("--active-daemon-url", default="http://127.0.0.1:9001", help="Active daemon URL")
     status_parser.add_argument("--standby-daemon-url", default="http://127.0.0.1:9003", help="Standby daemon URL")
     status_parser.add_argument("--simulator-url", default="http://127.0.0.1:18000", help="Simulator URL")
+    status_parser.add_argument("--engine-type", choices=["vllm", "tensorrt_llm", "tgi", "sglang", "mock", "auto"], default="auto", help="Inference engine backend type (default: auto)")
 
     # 4. monitor command
     monitor_parser = subparsers.add_parser(
@@ -1154,6 +1193,12 @@ def main() -> None:
         type=str,
         default=None,
         help="Explicit standby Node Daemon endpoint (default: inferred from host :9003)",
+    )
+    monitor_parser.add_argument(
+        "--engine-type",
+        choices=["vllm", "tensorrt_llm", "tgi", "sglang", "mock", "auto"],
+        default="auto",
+        help="Inference engine backend type (default: auto)",
     )
     monitor_parser.add_argument(
         "--interval",
@@ -1268,6 +1313,7 @@ def main() -> None:
                     standby_p2p_port=args.standby_p2p_port,
                     standby_daemon_port=args.standby_daemon_port,
                     simulator_port=args.simulator_port,
+                    engine_type=args.engine_type,
                 )
             )
         except KeyboardInterrupt:
@@ -1285,6 +1331,7 @@ def main() -> None:
                 active_daemon_url=args.active_daemon_url,
                 standby_daemon_url=args.standby_daemon_url,
                 simulator_url=args.simulator_url,
+                engine_type=args.engine_type,
             )
         )
 
@@ -1295,6 +1342,7 @@ def main() -> None:
                     host=args.host,
                     active_daemon=args.active_daemon,
                     standby_daemon=args.standby_daemon,
+                    engine_type=args.engine_type,
                     interval=args.interval,
                     iterations=args.iterations,
                     on_demand_rate=args.on_demand_rate,

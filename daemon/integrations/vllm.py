@@ -16,43 +16,15 @@ from typing import Any, AsyncIterator, Dict, List, Optional
 
 import aiohttp
 
-from daemon.integrations.base import AbstractInferenceEngineHook
+from daemon.integrations.base import (
+    AbortResult,
+    AbstractInferenceEngineHook,
+    BackendType,
+    EngineMetadata,
+)
 from daemon.models import InferenceSession, TokenChunk
 
 logger = logging.getLogger("sgm.daemon.integrations.vllm")
-
-
-class AbortResult(dict):
-    """Result of an engine abort or pause request."""
-
-    def __init__(
-        self,
-        success: bool,
-        latency_ms: float,
-        status_code: int = 200,
-        request_id: str = "",
-        message: str = "",
-    ) -> None:
-        super().__init__(
-            success=success,
-            latency_ms=latency_ms,
-            status_code=status_code,
-            request_id=request_id,
-            message=message,
-        )
-        self.success = success
-        self.latency_ms = latency_ms
-        self.status_code = status_code
-        self.request_id = request_id
-        self.message = message
-
-    def __bool__(self) -> bool:
-        return self.success
-
-    def __eq__(self, other: Any) -> bool:
-        if isinstance(other, bool):
-            return self.success == other
-        return super().__eq__(other)
 
 
 class VLLMInferenceEngineHook(AbstractInferenceEngineHook):
@@ -403,3 +375,18 @@ class VLLMInferenceEngineHook(AbstractInferenceEngineHook):
                 return resp.status == 200
         except Exception:
             return False
+
+    def get_engine_metadata(self) -> EngineMetadata:
+        """Returns metadata descriptor for vLLM."""
+        return EngineMetadata(
+            backend=BackendType.VLLM,
+            base_url=self.base_url,
+            version="0.6.0",
+            supports_abort_endpoint=True,
+            supports_prefix_caching=True,
+            native_streaming_endpoint=f"{self.base_url}/v1/chat/completions",
+            openai_compatible_endpoint=f"{self.base_url}/v1/chat/completions",
+            kv_cache_block_size=16,
+            detected_via="heuristic",
+        )
+

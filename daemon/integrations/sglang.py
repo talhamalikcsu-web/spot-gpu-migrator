@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict
 
+from daemon.integrations.base import BackendType, EngineMetadata
 from daemon.integrations.vllm import VLLMInferenceEngineHook
 from daemon.models import InferenceSession
 
@@ -36,3 +37,18 @@ class SGLangInferenceEngineHook(VLLMInferenceEngineHook):
         payload["skip_special_tokens"] = False
         payload["spaces_between_special_tokens"] = True
         return payload
+
+    def get_engine_metadata(self) -> EngineMetadata:
+        """Returns metadata descriptor for SGLang."""
+        return EngineMetadata(
+            backend=BackendType.SGLANG,
+            base_url=self.base_url,
+            version="0.3.0",
+            supports_abort_endpoint=True,
+            supports_prefix_caching=True,
+            native_streaming_endpoint=f"{self.base_url}/v1/chat/completions",
+            openai_compatible_endpoint=f"{self.base_url}/v1/chat/completions",
+            kv_cache_block_size=16,
+            detected_via="heuristic",
+        )
+

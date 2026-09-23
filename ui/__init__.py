@@ -11,6 +11,8 @@ from ui.dashboard import (
     FinancialTelemetry,
     PreemptionTelemetry,
     ClusterMonitor,
+    format_engine_badge,
+    normalize_engine_name,
 )
 
 __all__ = [
@@ -20,5 +22,7 @@ __all__ = [
     "FinancialTelemetry",
     "PreemptionTelemetry",
     "ClusterMonitor",
+    "format_engine_badge",
+    "normalize_engine_name",
 ]
 
